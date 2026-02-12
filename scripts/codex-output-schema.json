@@ -1,0 +1,73 @@
+{
+  "type": "object",
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 80,
+            "description": "Short title summarizing the issue"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Detailed explanation of the issue with suggested fix"
+          },
+          "confidence_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "How confident the reviewer is that this is a real issue (0-1)"
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3,
+            "description": "0=info, 1=low, 2=medium, 3=high"
+          },
+          "code_location": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Relative file path from repo root"
+              },
+              "start_line": {
+                "type": "integer",
+                "description": "Starting line number of the issue"
+              },
+              "end_line": {
+                "type": "integer",
+                "description": "Ending line number of the issue"
+              }
+            },
+            "required": ["path", "start_line", "end_line"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["title", "body", "confidence_score", "priority", "code_location"],
+        "additionalProperties": false
+      }
+    },
+    "overall_correctness": {
+      "type": "string",
+      "enum": ["patch is correct", "patch is incorrect"],
+      "description": "Overall verdict on the patch correctness"
+    },
+    "overall_explanation": {
+      "type": "string",
+      "description": "Brief explanation of the overall verdict"
+    },
+    "overall_confidence_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Confidence in the overall verdict (0-1)"
+    }
+  },
+  "required": ["findings", "overall_correctness", "overall_explanation", "overall_confidence_score"],
+  "additionalProperties": false
+}
