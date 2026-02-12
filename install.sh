@@ -88,7 +88,7 @@ fi
 echo
 echo "Checking Codex authentication..."
 if command -v codex &>/dev/null; then
-    if codex auth status &>/dev/null 2>&1; then
+    if codex login status &>/dev/null 2>&1; then
         echo "  Codex OAuth is configured."
     else
         echo

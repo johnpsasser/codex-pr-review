@@ -62,7 +62,7 @@ check_prereqs() {
   fi
 
   # Verify codex is authenticated via OAuth (headless mode requires OAuth, not API key)
-  if ! codex auth status &>/dev/null 2>&1; then
+  if ! codex login status &>/dev/null 2>&1; then
     echo "Error: codex CLI is not authenticated via OAuth. Run: codex login" >&2
     echo "Note: codex exec (headless mode) requires OAuth, not OPENAI_API_KEY." >&2
     exit 1
