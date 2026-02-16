@@ -9,7 +9,7 @@
 #   output_dir/chunk_count.txt  (contains the number of chunks)
 
 BEGIN {
-    if (chunk_size == 0) chunk_size = 10000
+    if (chunk_size == 0) chunk_size = 5000
     if (output_dir == "") output_dir = "/tmp/chunks"
 
     chunk_num = 1

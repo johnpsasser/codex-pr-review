@@ -15,7 +15,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 THRESHOLD="0.8"
 MODEL="gpt-5.3-codex"
 MAX_DIFF_LINES="200000"
-CHUNK_SIZE="10000"
+CHUNK_SIZE="5000"
 PR_ARG=""
 
 # ─── Arg Parsing ──────────────────────────────────────────────────────────────

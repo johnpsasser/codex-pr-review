@@ -39,12 +39,12 @@ Review a pull request using OpenAI Codex for an independent, cross-model code re
 | `PR_NUMBER` or `PR_URL` | auto-detect | PR to review. If omitted, detects from current branch |
 | `--threshold` | `0.8` | Minimum confidence score (0-1) for reporting findings |
 | `--model` | `gpt-5.3-codex` | Codex model to use |
-| `--chunk-size` | `10000` | Lines per chunk. Diffs exceeding this are split and reviewed in parallel |
+| `--chunk-size` | `5000` | Lines per chunk. Diffs exceeding this are split and reviewed in parallel |
 | `--max-diff-lines` | `200000` | Safety limit — diffs beyond this are truncated |
 
 ## Large PR Support
 
-PRs with diffs exceeding the chunk size (default 10,000 lines) are automatically split into chunks and reviewed in parallel:
+PRs with diffs exceeding the chunk size (default 5,000 lines) are automatically split into chunks and reviewed in parallel:
 
 1. The diff is split along file and hunk boundaries (never mid-hunk) using an AWK script
 2. Each chunk is reviewed independently by a separate `codex exec` instance, running in parallel
