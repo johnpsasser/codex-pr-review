@@ -4,6 +4,7 @@ set -euo pipefail
 # ─── Codex PR Review ─────────────────────────────────────────────────────────
 # Orchestrates a PR code review using OpenAI Codex CLI.
 # Usage: review.sh [PR_NUMBER|PR_URL] [--threshold FLOAT] [--model MODEL]
+#                  [--max-diff-lines INT] [--chunk-size INT]
 # ──────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,6 +14,8 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 THRESHOLD="0.8"
 MODEL="gpt-5.3-codex"
+MAX_DIFF_LINES="200000"
+CHUNK_SIZE="10000"
 PR_ARG=""
 
 # ─── Arg Parsing ──────────────────────────────────────────────────────────────
@@ -24,6 +27,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --model)
       MODEL="$2"
+      shift 2
+      ;;
+    --max-diff-lines)
+      MAX_DIFF_LINES="$2"
+      shift 2
+      ;;
+    --chunk-size)
+      CHUNK_SIZE="$2"
       shift 2
       ;;
     -*)
@@ -149,6 +160,277 @@ build_prompt() {
   echo "$template"
 }
 
+# ─── Build Chunk Prompt ──────────────────────────────────────────────────────
+build_chunk_prompt() {
+  local pr_number="$1"
+  local pr_title="$2"
+  local head_branch="$3"
+  local base_branch="$4"
+  local diff="$5"
+  local project_rules="$6"
+  local chunk_num="$7"
+  local total_chunks="$8"
+
+  local template
+  template=$(cat "$SCRIPT_DIR/codex-chunk-prompt.md")
+
+  local project_rules_section=""
+  if [[ -n "$project_rules" ]]; then
+    project_rules_section="$project_rules"
+  fi
+
+  template="${template//\{\{PROJECT_RULES\}\}/$project_rules_section}"
+  template="${template//\{\{PR_NUMBER\}\}/$pr_number}"
+  template="${template//\{\{PR_TITLE\}\}/$pr_title}"
+  template="${template//\{\{HEAD_BRANCH\}\}/$head_branch}"
+  template="${template//\{\{BASE_BRANCH\}\}/$base_branch}"
+  template="${template//\{\{DIFF\}\}/$diff}"
+  template="${template//\{\{CHUNK_NUM\}\}/$chunk_num}"
+  template="${template//\{\{TOTAL_CHUNKS\}\}/$total_chunks}"
+
+  echo "$template"
+}
+
+# ─── Build Synthesis Prompt ──────────────────────────────────────────────────
+build_synthesis_prompt() {
+  local pr_number="$1"
+  local pr_title="$2"
+  local head_branch="$3"
+  local base_branch="$4"
+  local chunk_results="$5"
+  local total_chunks="$6"
+
+  local template
+  template=$(cat "$SCRIPT_DIR/codex-synthesis-prompt.md")
+
+  template="${template//\{\{PR_NUMBER\}\}/$pr_number}"
+  template="${template//\{\{PR_TITLE\}\}/$pr_title}"
+  template="${template//\{\{HEAD_BRANCH\}\}/$head_branch}"
+  template="${template//\{\{BASE_BRANCH\}\}/$base_branch}"
+  template="${template//\{\{CHUNK_RESULTS\}\}/$chunk_results}"
+  template="${template//\{\{TOTAL_CHUNKS\}\}/$total_chunks}"
+
+  echo "$template"
+}
+
+# ─── Review Single Chunk (background job) ────────────────────────────────────
+review_chunk() {
+  local chunk_file="$1"
+  local chunk_num="$2"
+  local total_chunks="$3"
+  local pr_number="$4"
+  local pr_title="$5"
+  local head_branch="$6"
+  local base_branch="$7"
+  local project_rules="$8"
+  local output_file="$9"
+
+  local chunk_diff
+  chunk_diff=$(cat "$chunk_file")
+
+  local prompt
+  prompt=$(build_chunk_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_diff" "$project_rules" "$chunk_num" "$total_chunks")
+
+  local prompt_file="$WORK_DIR/chunk-prompt-${chunk_num}.md"
+  echo "$prompt" > "$prompt_file"
+
+  if codex exec \
+    --model "$MODEL" \
+    --output-schema "$WORK_DIR/codex-output-schema.json" \
+    --sandbox read-only \
+    - < "$prompt_file" > "$output_file" 2>"$WORK_DIR/chunk-stderr-${chunk_num}.log"; then
+    # Validate JSON
+    if jq empty "$output_file" 2>/dev/null; then
+      echo "  Chunk $chunk_num/$total_chunks completed." >&2
+      return 0
+    fi
+  fi
+
+  echo "  Chunk $chunk_num/$total_chunks FAILED." >&2
+  return 1
+}
+
+# ─── Single Review Path ──────────────────────────────────────────────────────
+run_single_review() {
+  local pr_number="$1"
+  local pr_title="$2"
+  local head_branch="$3"
+  local base_branch="$4"
+  local diff="$5"
+  local project_rules="$6"
+
+  # Build prompt
+  echo "Building review prompt..." >&2
+  local prompt
+  prompt=$(build_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules")
+  echo "$prompt" > "$WORK_DIR/codex-prompt-filled.md"
+
+  # Copy schema to work dir
+  cp "$SCRIPT_DIR/codex-output-schema.json" "$WORK_DIR/"
+
+  # Run Codex
+  echo "Running Codex review (this may take a minute)..." >&2
+  if ! codex exec \
+    --model "$MODEL" \
+    --output-schema "$WORK_DIR/codex-output-schema.json" \
+    --sandbox read-only \
+    - < "$WORK_DIR/codex-prompt-filled.md" > "$WORK_DIR/codex-output.json" 2>"$WORK_DIR/codex-stderr.log"; then
+    echo "Error: Codex execution failed." >&2
+    if [[ -f "$WORK_DIR/codex-stderr.log" ]]; then
+      cat "$WORK_DIR/codex-stderr.log" >&2
+    fi
+    exit 3
+  fi
+
+  # Validate output
+  if [[ ! -f "$WORK_DIR/codex-output.json" ]]; then
+    echo "Error: Codex did not produce output." >&2
+    exit 3
+  fi
+
+  if ! jq empty "$WORK_DIR/codex-output.json" 2>/dev/null; then
+    echo "Error: Codex output is not valid JSON." >&2
+    exit 3
+  fi
+}
+
+# ─── Chunked Review Path ────────────────────────────────────────────────────
+run_chunked_review() {
+  local pr_number="$1"
+  local pr_title="$2"
+  local head_branch="$3"
+  local base_branch="$4"
+  local diff="$5"
+  local project_rules="$6"
+
+  # Copy schema to work dir
+  cp "$SCRIPT_DIR/codex-output-schema.json" "$WORK_DIR/"
+
+  # Write diff to file and split into chunks
+  local diff_file="$WORK_DIR/full-diff.txt"
+  echo "$diff" > "$diff_file"
+
+  local chunk_dir="$WORK_DIR/chunks"
+  mkdir -p "$chunk_dir"
+
+  echo "Splitting diff into chunks (chunk size: $CHUNK_SIZE lines)..." >&2
+  awk -v chunk_size="$CHUNK_SIZE" -v output_dir="$chunk_dir" \
+    -f "$SCRIPT_DIR/chunk-diff.awk" < "$diff_file"
+
+  local total_chunks
+  total_chunks=$(cat "$chunk_dir/chunk_count.txt")
+  echo "Split into $total_chunks chunks." >&2
+
+  # If chunking produced only 1 chunk, fall back to single review
+  if [[ "$total_chunks" -eq 1 ]]; then
+    echo "Only 1 chunk produced, using single review path." >&2
+    local single_diff
+    single_diff=$(cat "$chunk_dir/chunk_001.diff")
+    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$single_diff" "$project_rules"
+    return
+  fi
+
+  # Launch parallel chunk reviews
+  echo "Launching $total_chunks parallel chunk reviews..." >&2
+  local pids=()
+  local chunk_outputs=()
+
+  for i in $(seq 1 "$total_chunks"); do
+    local padded
+    padded=$(printf "%03d" "$i")
+    local chunk_file="$chunk_dir/chunk_${padded}.diff"
+    local output_file="$WORK_DIR/chunk-output-${padded}.json"
+    chunk_outputs+=("$output_file")
+
+    review_chunk "$chunk_file" "$i" "$total_chunks" \
+      "$pr_number" "$pr_title" "$head_branch" "$base_branch" \
+      "$project_rules" "$output_file" &
+    pids+=($!)
+  done
+
+  # Wait for all chunks and count failures
+  local failures=0
+  local succeeded=0
+  for i in "${!pids[@]}"; do
+    if wait "${pids[$i]}"; then
+      succeeded=$((succeeded + 1))
+    else
+      failures=$((failures + 1))
+    fi
+  done
+
+  echo "Chunk reviews complete: $succeeded succeeded, $failures failed." >&2
+
+  # If ALL chunks failed, exit
+  if [[ "$succeeded" -eq 0 ]]; then
+    echo "Error: All chunk reviews failed." >&2
+    for i in $(seq 1 "$total_chunks"); do
+      local padded
+      padded=$(printf "%03d" "$i")
+      local stderr_file="$WORK_DIR/chunk-stderr-${padded}.log"
+      if [[ -f "$stderr_file" ]] && [[ -s "$stderr_file" ]]; then
+        echo "--- Chunk $i stderr ---" >&2
+        cat "$stderr_file" >&2
+      fi
+    done
+    exit 3
+  fi
+
+  # Build chunk results JSON array from successful outputs
+  echo "Synthesizing chunk results..." >&2
+  local chunk_results="["
+  local first=true
+
+  for i in $(seq 1 "$total_chunks"); do
+    local padded
+    padded=$(printf "%03d" "$i")
+    local output_file="$WORK_DIR/chunk-output-${padded}.json"
+
+    if [[ -f "$output_file" ]] && jq empty "$output_file" 2>/dev/null; then
+      if [[ "$first" == "true" ]]; then
+        first=false
+      else
+        chunk_results+=","
+      fi
+      # Wrap each chunk result with its chunk number
+      chunk_results+=$(jq -c --argjson n "$i" '{chunk: $n, result: .}' "$output_file")
+    fi
+  done
+
+  chunk_results+="]"
+
+  # Build and run synthesis prompt
+  local synthesis_prompt
+  synthesis_prompt=$(build_synthesis_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$chunk_results" "$total_chunks")
+
+  local synthesis_prompt_file="$WORK_DIR/synthesis-prompt.md"
+  echo "$synthesis_prompt" > "$synthesis_prompt_file"
+
+  echo "Running synthesis review..." >&2
+  if ! codex exec \
+    --model "$MODEL" \
+    --output-schema "$WORK_DIR/codex-output-schema.json" \
+    --sandbox read-only \
+    - < "$synthesis_prompt_file" > "$WORK_DIR/codex-output.json" 2>"$WORK_DIR/synthesis-stderr.log"; then
+    echo "Error: Synthesis step failed." >&2
+    if [[ -f "$WORK_DIR/synthesis-stderr.log" ]]; then
+      cat "$WORK_DIR/synthesis-stderr.log" >&2
+    fi
+    exit 3
+  fi
+
+  # Validate synthesis output
+  if [[ ! -f "$WORK_DIR/codex-output.json" ]]; then
+    echo "Error: Synthesis did not produce output." >&2
+    exit 3
+  fi
+
+  if ! jq empty "$WORK_DIR/codex-output.json" 2>/dev/null; then
+    echo "Error: Synthesis output is not valid JSON." >&2
+    exit 3
+  fi
+}
+
 # ─── Format Comment ──────────────────────────────────────────────────────────
 format_comment() {
   local output_file="$1"
@@ -265,7 +547,7 @@ main() {
 
   echo "Reviewing PR #$pr_number: $pr_title" >&2
   echo "  Branch: $head_branch → $base_branch" >&2
-  echo "  Model: $MODEL | Threshold: $THRESHOLD" >&2
+  echo "  Model: $MODEL | Threshold: $THRESHOLD | Chunk size: $CHUNK_SIZE" >&2
 
   # Gather diff
   echo "Gathering diff..." >&2
@@ -277,13 +559,14 @@ main() {
     exit 2
   fi
 
-  # Truncate very large diffs to avoid token limits
+  # Safety valve: truncate truly enormous diffs
   local diff_lines
-  diff_lines=$(echo "$diff" | wc -l)
-  if [[ "$diff_lines" -gt 5000 ]]; then
-    echo "Warning: Diff is $diff_lines lines, truncating to 5000 for token budget." >&2
-    diff=$(echo "$diff" | head -n 5000)
-    diff+=$'\n\n... (diff truncated at 5000 lines)'
+  diff_lines=$(echo "$diff" | wc -l | tr -d ' ')
+  if [[ "$diff_lines" -gt "$MAX_DIFF_LINES" ]]; then
+    echo "Warning: Diff is $diff_lines lines, truncating to $MAX_DIFF_LINES (safety limit)." >&2
+    diff=$(echo "$diff" | head -n "$MAX_DIFF_LINES")
+    diff+=$'\n\n... (diff truncated at '"$MAX_DIFF_LINES"' lines)'
+    diff_lines="$MAX_DIFF_LINES"
   fi
 
   # Gather project rules
@@ -291,41 +574,16 @@ main() {
   local project_rules
   project_rules=$(gather_project_rules)
 
-  # Build prompt
-  echo "Building review prompt..." >&2
-  local prompt
-  prompt=$(build_prompt "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules")
-  echo "$prompt" > "$WORK_DIR/codex-prompt-filled.md"
-
-  # Copy schema to work dir
-  cp "$SCRIPT_DIR/codex-output-schema.json" "$WORK_DIR/"
-
-  # Run Codex
-  echo "Running Codex review (this may take a minute)..." >&2
-  if ! codex exec \
-    --model "$MODEL" \
-    --output-schema "$WORK_DIR/codex-output-schema.json" \
-    --sandbox read-only \
-    - < "$WORK_DIR/codex-prompt-filled.md" > "$WORK_DIR/codex-output.json" 2>"$WORK_DIR/codex-stderr.log"; then
-    echo "Error: Codex execution failed." >&2
-    if [[ -f "$WORK_DIR/codex-stderr.log" ]]; then
-      cat "$WORK_DIR/codex-stderr.log" >&2
-    fi
-    exit 3
+  # Route: single review vs chunked review
+  if [[ "$diff_lines" -le "$CHUNK_SIZE" ]]; then
+    echo "Diff is $diff_lines lines (within chunk size $CHUNK_SIZE), using single review." >&2
+    run_single_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules"
+  else
+    echo "Diff is $diff_lines lines (exceeds chunk size $CHUNK_SIZE), using chunked review." >&2
+    run_chunked_review "$pr_number" "$pr_title" "$head_branch" "$base_branch" "$diff" "$project_rules"
   fi
 
-  # Validate output
-  if [[ ! -f "$WORK_DIR/codex-output.json" ]]; then
-    echo "Error: Codex did not produce output." >&2
-    exit 3
-  fi
-
-  if ! jq empty "$WORK_DIR/codex-output.json" 2>/dev/null; then
-    echo "Error: Codex output is not valid JSON." >&2
-    exit 3
-  fi
-
-  # Format and post
+  # Format and post (same for both paths — both produce codex-output.json)
   echo "Formatting results..." >&2
   local comment
   comment=$(format_comment "$WORK_DIR/codex-output.json" "$pr_url")

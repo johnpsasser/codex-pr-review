@@ -4,9 +4,9 @@ description: Review a pull request using OpenAI Codex (gpt-5.3-codex). Use when 
 license: MIT
 metadata:
   author: sasser
-  version: 0.1.0
+  version: 0.2.0
 allowed-tools: Bash
-argument-hint: "[PR_NUMBER|PR_URL] [--threshold FLOAT] [--model MODEL]"
+argument-hint: "[PR_NUMBER|PR_URL] [--threshold FLOAT] [--model MODEL] [--chunk-size INT] [--max-diff-lines INT]"
 ---
 
 # Codex PR Review
@@ -27,6 +27,9 @@ Review a pull request using OpenAI Codex for an independent, cross-model code re
 /codex-pr-review 123                      # Review PR #123
 /codex-pr-review --threshold 0.6          # Lower confidence threshold
 /codex-pr-review 123 --model gpt-5.2-codex  # Use a specific model
+/codex-pr-review --max-diff-lines 25000     # Increase diff safety limit
+/codex-pr-review --chunk-size 5000           # Smaller chunks for faster parallel reviews
+/codex-pr-review --chunk-size 50 123         # Force chunking (useful for testing)
 ```
 
 ## Arguments
@@ -36,6 +39,19 @@ Review a pull request using OpenAI Codex for an independent, cross-model code re
 | `PR_NUMBER` or `PR_URL` | auto-detect | PR to review. If omitted, detects from current branch |
 | `--threshold` | `0.8` | Minimum confidence score (0-1) for reporting findings |
 | `--model` | `gpt-5.3-codex` | Codex model to use |
+| `--chunk-size` | `10000` | Lines per chunk. Diffs exceeding this are split and reviewed in parallel |
+| `--max-diff-lines` | `200000` | Safety limit — diffs beyond this are truncated |
+
+## Large PR Support
+
+PRs with diffs exceeding the chunk size (default 10,000 lines) are automatically split into chunks and reviewed in parallel:
+
+1. The diff is split along file and hunk boundaries (never mid-hunk) using an AWK script
+2. Each chunk is reviewed independently by a separate `codex exec` instance, running in parallel
+3. All chunk results are synthesized into a single coherent review that deduplicates findings and detects cross-chunk patterns
+4. The final output uses the same format as a single-chunk review
+
+This allows reviewing PRs of 100K+ lines without truncation. Use `--chunk-size` to tune the chunk size (smaller = more parallelism but more synthesis overhead).
 
 ## How to Execute This Skill
 
