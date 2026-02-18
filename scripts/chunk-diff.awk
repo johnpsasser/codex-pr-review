@@ -1,5 +1,5 @@
 # chunk-diff.awk — Split a unified diff into ~chunk_size-line chunks
-# along file and hunk boundaries. Never splits mid-hunk.
+# along file and hunk boundaries. Splits mid-hunk when a hunk exceeds chunk_size.
 #
 # Usage:
 #   awk -v chunk_size=10000 -v output_dir=/tmp/chunks -f chunk-diff.awk < diff.txt
@@ -38,8 +38,10 @@ BEGIN {
 }
 
 # Accumulate file header lines (index, ---, +++ that follow "diff --git")
+# Only match when NOT inside a hunk — otherwise lines like "--- old text" in
+# diff content would be incorrectly stolen from the hunk buffer.
 /^index / || /^--- / || /^\+\+\+ / || /^old mode / || /^new mode / || /^new file mode / || /^deleted file mode / || /^similarity index / || /^rename from / || /^rename to / || /^Binary files / {
-    if (file_header != "") {
+    if (!in_hunk && file_header != "") {
         file_header = file_header $0 "\n"
         next
     }
@@ -70,6 +72,22 @@ BEGIN {
     if (in_hunk) {
         hunk_buf = hunk_buf $0 "\n"
         hunk_line_count++
+
+        # Mid-hunk splitting — only for truly oversized hunks.
+        # chunk_size is a guideline for file/hunk boundary splits (handled above).
+        # Within a hunk, we're generous: prefer one 8K chunk over two 5K + 3K
+        # when the content is logically connected.
+        #   soft limit (1.5x): start looking for context lines to split at
+        #   hard limit (2.5x): force-split regardless
+        total = chunk_lines + hunk_line_count
+        if (total >= chunk_size * 1.5) {
+            is_context_line = (substr($0, 1, 1) == " " || $0 == "")
+            if (is_context_line || total >= chunk_size * 2.5) {
+                flush_hunk()
+                close_chunk()
+                in_hunk = 1  # still inside the same logical hunk
+            }
+        }
     } else if (file_header != "") {
         # Lines between file header and first hunk (shouldn't happen in valid diffs)
         file_header = file_header $0 "\n"
