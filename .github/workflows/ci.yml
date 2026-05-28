@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test-suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Node 18 is the minimum the AST chunker (scripts/plan.js + tree-sitter)
+      # supports per scripts/package.json "engines".
+      - name: Set up Node 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      # jq is preinstalled on ubuntu-latest runners; install as a guard so the
+      # suite (which leans heavily on jq) never fails for a missing binary.
+      - name: Ensure jq is present
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+          jq --version
+
+      # Install the Node helper deps (tree-sitter grammars) only if a manifest
+      # exists. The test suite is hermetic without these — the chunker tests
+      # that need tree-sitter use the AWK fallback path — but installing keeps
+      # plan.js's AST mode exercisable.
+      - name: Install scripts/ npm deps
+        run: |
+          if [ -f scripts/package.json ]; then
+            cd scripts
+            npm install --no-audit --no-fund
+          else
+            echo "no scripts/package.json; skipping npm install"
+          fi
+
+      # The suite is hermetic by default: the only network path is
+      # test-verifier.sh Test 5, gated behind RECORD=1. We deliberately do NOT
+      # set RECORD, and run-all.sh also unsets it defensively. No OpenAI /
+      # Anthropic / GitHub API access is required.
+      - name: Run test suite
+        env:
+          CI: "true"
+        run: bash tests/run-all.sh

@@ -26,6 +26,8 @@ In addition to the standard review criteria, you MUST:
 1. **Assess prior findings** — For each finding from the previous review, determine whether the current diff resolves it. If resolved, add the finding's title to `resolved_prior_findings`. If the finding persists (not fixed or incompletely fixed), include it in your findings with `"status": "persisting"`.
 2. **Verify fix correctness** — When a prior finding has been addressed, verify the fix is correct and complete. A bad fix is worse than an unfixed issue — flag regressions with high priority.
 3. **New issues** — Flag any new issues with `"status": "new"`. Apply the same review criteria as a standard review.
+
+**A finding's `status` field must be `"new"` or `"persisting"` only — those are the only two values the schema allows.** `resolved` and `regressed` are NOT finding statuses; never emit `"status": "resolved"` or `"status": "regressed"` (doing so fails schema validation). Resolved and regressed are tracked separately in the top-level `delta` block (`delta.resolved` / `delta.regressed`), which the synthesis step populates — not on individual findings. Report a resolved prior finding by adding its title to `resolved_prior_findings` (and let synthesis route it into `delta.resolved`); do not carry it forward as a finding.
 4. **Set review_iteration** — Set `review_iteration` to {{REVIEW_ITERATION}}.
 5. **Update verdict** — Your overall verdict should reflect the **current state** of the PR, accounting for both fixes and any remaining or new issues.
 6. **Summarize progress** — In `overall_explanation`, briefly note what was fixed, what remains, and any new concerns.

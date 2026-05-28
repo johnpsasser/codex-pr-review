@@ -61,7 +61,7 @@ PRs whose diff exceeds `--chunk-size` are split into chunks and reviewed in para
 
 1. The diff is split using **AST-aware chunking** for Python / TypeScript / Go (chunks snap to function/class boundaries) or hunk-aware AWK chunking for everything else. Set `--chunker hunk` to force the legacy AWK splitter; `--chunker ast` to force AST.
 2. Each chunk is reviewed twice in parallel — once by Codex (`codex exec`) and once by Claude (`claude --print`). Both reviewers see the same chunk plus a per-chunk *neighbors* manifest (cross-chunk symbol index) so they don't false-flag forward references as "undefined."
-3. Every LLM finding is then verified by the *other* family (Claude Haiku 4.5 verifies Codex findings; Codex CLI verifies Claude findings). Refuted findings are dropped; inconclusive findings are escalated to Opus and posted as `[unconfirmed-by-X]` if the escalation also can't confirm.
+3. Every LLM finding is then verified by the *other* family (Claude — Opus 4.7 by default, `--model-verifier claude-haiku-4-5` for a cheaper run — verifies Codex findings; Codex CLI verifies Claude findings). Refuted findings are dropped; inconclusive findings are escalated to Opus and posted as `[unconfirmed-by-X]` if the escalation also can't confirm.
 4. A final synthesis step (Claude Opus by default) deduplicates, generates per-finding suggested fixes, and produces the merged comment.
 
 ## v2 — Cross-family verification, deterministic floor, iteration modes
@@ -91,7 +91,7 @@ tests = "pytest -x --tb=short"
 test_files_only = true
 ```
 
-If no config is detectable, the floor silently no-ops.
+If no config is detectable, the floor no-ops (with a note on stderr).
 
 **Iteration modes (`--mode`):**
 
@@ -145,7 +145,3 @@ If the script exits non-zero, display the error message to the user.
 | 2 | PR not found, empty diff, or incompatible flag (e.g., `--mode delta` with no prior review) |
 | 3 | Codex / Claude execution failed |
 | 4 | Failed to post comment |
-
-## Rollback
-
-Install with `./install.sh --version 1` to revert to the v1 single-Codex pipeline. The installer preserves the v1 `review.sh` as `review-v1.sh` for manual rollback if needed.
