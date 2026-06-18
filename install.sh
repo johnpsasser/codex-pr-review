@@ -81,7 +81,7 @@ fi
 # Copy skill files
 echo "Installing skill files to $SKILL_DIR..."
 mkdir -p "$SKILL_DIR/scripts"
-cp "$SCRIPT_DIR/SKILL.md" "$SKILL_DIR/"
+cp "$SCRIPT_DIR/skills/codex-pr-review/SKILL.md" "$SKILL_DIR/"
 cp "$SCRIPT_DIR/scripts/review.sh" "$SKILL_DIR/scripts/"
 # Save a v1 reference copy alongside the installed review.sh so a downgrade
 # can restore it. We always copy v1's review.sh source (the current main
