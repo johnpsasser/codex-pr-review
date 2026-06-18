@@ -39,6 +39,10 @@ At the top level of your response object, also emit:
 
 These are populated by the orchestrator and the synthesizer downstream, not by you.
 
+## Output Format
+
+Output a single JSON object that conforms exactly to the schema you have been given. Do not emit any prose, preamble, code fences, or trailing commentary — only the JSON object. The required top-level fields are `findings`, `overall_correctness`, `overall_explanation`, `overall_confidence_score`, `review_iteration`, `resolved_prior_findings`, `iteration_meta`, and `delta`. Use the v2 `overall_correctness` enum (`"correct"`, `"needs-changes"`, `"blocking"`, or `"insufficient information"`).
+
 ## Review-only Rules
 
 These rules take precedence over project-wide rules for code review decisions. They describe what to flag, what to ignore, and how to weight findings.

@@ -30,7 +30,7 @@ If the section below is empty (no tools configured, or none produced findings on
 
 You have exactly five tasks. Do not perform any task outside this list.
 
-1. **Deduplicate findings** by `(file, line_range overlap > 50%, category)`. When two findings collapse, keep the one with higher `confidence_score`. If sources differ across the duplicates, set the surviving finding's `agreement` to `"both"`. Carry both `source` tags forward (you may add a `_dup_sources` field on the surviving finding if helpful — that field is internal and is stripped before posting).
+1. **Deduplicate findings** by `(code_location.path, line-range overlap > 50% between the two findings' `code_location.start_line`–`code_location.end_line` ranges, and semantic similarity of `title`/`body`)`. Two findings are duplicates only when they cite the same file path, their line ranges overlap by more than 50%, and their `title`/`body` describe the same underlying issue. When two findings collapse, keep the one with higher `confidence_score`. If sources differ across the duplicates, set the surviving finding's `agreement` to `"both"`. Carry both `source` tags forward (you may add a `_dup_sources` field on the surviving finding if helpful — that field is internal and is stripped before posting).
 
 2. **Assign agreement labels** based on the `source` fields of deduplicated duplicates:
    - Both `codex` and `claude` flagged it → `agreement: "both"`.

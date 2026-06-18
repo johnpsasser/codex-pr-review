@@ -10,7 +10,7 @@ When you run `/codex-pr-review`, the skill:
 2. Builds an AST-aware plan + manifest of files, symbols, and per-chunk neighbors so the reviewers don't false-flag forward references.
 3. Runs the deterministic floor (lint / typecheck / tests on changed lines) in parallel with the LLM fan-out.
 4. For each chunk, runs Codex and Claude in parallel against identical prompts and a structured output schema.
-5. For every LLM finding, runs the *other* family's grounded verifier (Claude Haiku for Codex findings; Codex CLI for Claude findings). Refuted findings are dropped; inconclusive findings are escalated to Opus then posted with `[unconfirmed]`.
+5. For every LLM finding, runs the *other* family's grounded verifier (Claude — Opus 4.7 by default, override with `--model-verifier claude-haiku-4-5` — for Codex findings; Codex CLI for Claude findings). Refuted findings are dropped; inconclusive findings are escalated to Opus then posted with `[unconfirmed]`.
 6. Synthesizes the merged finding list (deduplicate, label agreement, generate suggested fix per finding, compute v2 verdict).
 7. Validates locations deterministically — drops findings whose `(file, line)` does not resolve in the diff (with a maintainability exception for unchanged-but-related lines).
 8. Posts a single PR comment with three sections: **Resolved since last review** / **Findings** / **Persisting from prior review**.
@@ -30,8 +30,7 @@ Findings are filtered by a configurable confidence threshold (default 0.8) so yo
 ```bash
 git clone https://github.com/johnpsasser/codex-pr-review.git
 cd codex-pr-review
-./install.sh                # v2 (default)
-./install.sh --version 1    # roll back to the legacy single-Codex pipeline
+./install.sh
 ```
 
 Then restart Claude Code.
@@ -58,7 +57,7 @@ Then restart Claude Code.
 | `--threshold` | `0.8` | Confidence threshold (post-verifier) |
 | `--model-codex` (alias `--model`) | `gpt-5.3-codex` | Codex reviewer model |
 | `--model-claude` | `claude-opus-4-7` | Claude reviewer + synthesizer model |
-| `--model-verifier` | `claude-haiku-4-5` | Default cross-family verifier |
+| `--model-verifier` | `claude-opus-4-7` | Default cross-family verifier (override with `claude-haiku-4-5` for cheaper, more deferential verification) |
 | `--chunker` | `auto` | `auto`, `ast`, or `hunk` |
 | `--review-rules` | (auto) | Path to override REVIEW.md / CLAUDE.md discovery |
 | `--chunk-size` | `3000` | Lines per chunk |
@@ -127,7 +126,7 @@ tests = "pytest -x --tb=short"
 test_files_only = true
 ```
 
-If no config is detectable, the floor silently no-ops — no surprise tool runs.
+If no config is detectable, the floor no-ops (with a note on stderr) — no surprise tool runs.
 
 ## Iteration modes
 
@@ -143,7 +142,7 @@ Force a mode with `--mode {initial|followup|delta}`.
 
 PRs whose diff exceeds `--chunk-size` are split and reviewed in parallel:
 
-1. **AST-aware chunking** for Python / TypeScript / Go (chunks snap to function/class boundaries; `tree-sitter` grammars vendored under `scripts/grammars/`). Hunk-aware AWK chunking is the fallback for everything else.
+1. **AST-aware chunking** for Python / TypeScript / Go (chunks snap to function/class boundaries; `tree-sitter` bindings installed via npm into `scripts/node_modules/` during install). Hunk-aware AWK chunking is the fallback for everything else.
 2. Each chunk has a per-chunk **neighbors manifest** — every symbol referenced in this chunk but defined elsewhere in the PR — so reviewers don't flag forward references as "undefined."
 3. Each chunk is reviewed twice in parallel — once by Codex, once by Claude. Failed chunks are retried up to 3 times with exponential backoff. Stderr and prompts of any chunks that ultimately fail are preserved in `/tmp/codex-pr-review-failures-*`.
 4. The cross-family verifier dispatches per-finding verification jobs in parallel (capped at `min(--max-parallel * 2, 8)`).
@@ -164,7 +163,7 @@ PRs whose diff exceeds `--chunk-size` are split and reviewed in parallel:
 ```
 codex-pr-review/
 ├── SKILL.md                              # Claude Code skill definition (v2.0.0)
-├── install.sh                            # Installer (--version 1|2; v2 is default)
+├── install.sh                            # Installer (stages into a temp dir, then atomically swaps into place)
 ├── README.md
 ├── CHANGELOG.md
 ├── LICENSE
@@ -176,7 +175,7 @@ codex-pr-review/
     ├── plan.js                           # AST-aware chunker + manifest builder
     ├── ast-chunk.sh                      # Bash wrapper for plan.js
     ├── chunk-diff.awk                    # Hunk-aware AWK chunker (fallback)
-    ├── grammars/                         # Vendored tree-sitter WASM grammars
+    ├── grammars/                         # WASM-fallback placeholder; tree-sitter bindings install via npm into scripts/node_modules/
     ├── det-floor.sh                      # Deterministic lint/typecheck/test floor
     ├── det-output-schema.json
     ├── location-validator.sh             # Post-synthesis deterministic filter

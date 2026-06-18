@@ -50,6 +50,7 @@ function parseArgs(argv) {
     chunker: 'auto',
     chunksDir: null,
     awk: path.join(__dirname, 'chunk-diff.awk'),
+    headSha: null,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -60,6 +61,7 @@ function parseArgs(argv) {
       case '--chunker':    args.chunker = argv[++i]; break;
       case '--chunks-dir': args.chunksDir = argv[++i]; break;
       case '--awk':        args.awk = argv[++i]; break;
+      case '--head-sha':   args.headSha = argv[++i]; break;
       case '-h':
       case '--help':
         printHelp();
@@ -92,6 +94,9 @@ Options:
   --chunker auto|ast|hunk  Chunking strategy [default: auto]
   --chunks-dir <path>      Output dir for chunk_NNN.diff [default: <output>/chunks]
   --awk <path>             Path to chunk-diff.awk (for hunk fallback)
+  --head-sha <sha>         Read file content for AST parsing from this git SHA
+                           via 'git show <sha>:<path>' instead of the working
+                           tree (use the PR head SHA for correct AST spans)
 `);
 }
 
@@ -204,6 +209,16 @@ function detectLanguage(filePath) {
   return null;
 }
 
+// Source-code extensions that AST chunking does NOT support. Used only to
+// produce an observable stderr notice when such files fall through to hunk
+// mode (detectLanguage returns null for them). Not exhaustive — kept to common
+// languages so the notice is meaningful rather than noisy.
+const CODE_EXTS = new Set([
+  '.js', '.jsx', '.mjs', '.cjs', '.rs', '.java', '.rb', '.cs', '.c', '.h',
+  '.cpp', '.cc', '.cxx', '.hpp', '.kt', '.kts', '.swift', '.php', '.scala',
+  '.m', '.mm', '.lua', '.dart', '.ex', '.exs', '.clj', '.hs', '.pl', '.sh',
+]);
+
 // ─── Tree-sitter loading (graceful fallback) ────────────────────────────────
 function loadTreeSitter() {
   function tryRequire(modName) {
@@ -247,7 +262,22 @@ function loadTreeSitter() {
   return out;
 }
 
-function readFileAtHead(filePath) {
+// Read the post-image content of a file for AST parsing. When headSha is
+// provided we read the blob at that revision via `git show <sha>:<path>` so the
+// AST reflects the PR head (the working tree may be on a different ref). On any
+// failure we fall back to reading the working-tree file, preserving prior
+// behavior. We use spawnSync(file, args[]) — no shell interpolation.
+function readFileAtHead(filePath, headSha) {
+  if (headSha) {
+    try {
+      const r = cp.spawnSync('git', ['show', `${headSha}:${filePath}`], {
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      if (r.status === 0 && typeof r.stdout === 'string') return r.stdout;
+    } catch (_) {}
+    // Fall through to working-tree read below.
+  }
   try { return fs.readFileSync(filePath, 'utf8'); } catch (_) { return null; }
 }
 
@@ -363,7 +393,7 @@ function extractSymbolsFromDiff(diffText) {
 }
 
 // ─── AST chunking core ──────────────────────────────────────────────────────
-function planAstChunks(files, chunkSize, ts) {
+function planAstChunks(files, chunkSize, ts, headSha) {
   const overshoot = Math.floor(chunkSize * 1.25);
   const chunks = [];
   let cur = { id: 1, files: [], lines: 0 };
@@ -378,12 +408,26 @@ function planAstChunks(files, chunkSize, ts) {
 
     if (file.language && ts && ts.languages[file.language] && !file.binary && !file.deleted) {
       file._defs = [];
-      const src = readFileAtHead(file.path);
+      const src = readFileAtHead(file.path, headSha);
       if (src != null) {
         try { file._defs = definitionSpans(ts, file.language, src); } catch (_) {}
       }
+      // Silent degradation symptom: a supported, non-binary, non-trivial source
+      // file whose AST yields zero definitions almost always means we read the
+      // wrong content (e.g., the working tree is not at PR head, or the file is
+      // empty/missing locally). Emit a one-line notice but never fail.
+      if (file._defs.length === 0 && src != null && src.trim().length > 40) {
+        warn(`no AST definitions found for ${file.path} (${file.language}); ` +
+             `chunking by file boundary only` +
+             (headSha ? '' : ' — pass --head-sha to read content at PR head'));
+      } else if (src == null) {
+        warn(`could not read content for ${file.path}; chunking by file boundary only`);
+      }
     }
 
+    // Files with no reviewable hunks (binary/rename/mode-only) are excluded
+    // from chunk-size planning (fileLines is minimal) but still ride along in
+    // the chunk so they are reported in the manifest/file list.
     if (cur.lines > 0 && cur.lines + fileLines > overshoot) {
       commit();
     }
@@ -395,11 +439,28 @@ function planAstChunks(files, chunkSize, ts) {
   return chunks;
 }
 
+// Estimate the number of diff lines a file contributes to a chunk. Files with
+// no reviewable content (binary blobs, pure renames, mode-change-only) carry
+// almost no payload, so charging them the full per-file overhead inflated
+// chunk-size math and produced empty/near-empty chunks. We charge such files a
+// minimal fixed overhead and let files with real hunks drive the planning.
 function countDiffLines(file) {
+  if (file.hunks.length === 0) {
+    // Binary / rename-only / mode-only: just the diff header + a metadata line
+    // or two. Keep it small so these files never dominate a chunk's budget.
+    return file.binary ? 2 : 1;
+  }
   let n = 1;        // diff --git
   n += 3;           // approx index/--- /+++
   for (const h of file.hunks) n += h.content.split('\n').length;
   return n;
+}
+
+// True when a file carries no LLM-reviewable diff content (binary, pure
+// rename, or mode-change-only). Such files are still recorded in the manifest
+// and file list, but excluded from chunk-size planning.
+function hasNoReviewableContent(file) {
+  return file.hunks.length === 0;
 }
 
 // ─── Neighbors index ────────────────────────────────────────────────────────
@@ -519,10 +580,21 @@ function emitAstChunks(diffText, files, chunks, chunksDir, chunkSize, awkPath) {
   let totalChunks = 0;
   for (const ch of chunks) {
     const totalLines = ch.files.reduce((acc, f) => acc + countDiffLines(f), 0);
-    const needsAwk = ch.files.length === 1 && totalLines > overshoot && fs.existsSync(awkPath);
+    // Oversize-split delegation: ANY chunk (single- or multi-file) whose total
+    // line count exceeds the overshoot threshold is handed to the awk
+    // hunk-splitter so no single emitted chunk grossly exceeds the size cap.
+    // (Previously only single-file chunks delegated, so a multi-file chunk over
+    // the cap was emitted whole — defeating the size guarantee.) We build the
+    // sub-diff from ALL files in the chunk, in their original order.
+    const needsAwk = totalLines > overshoot && fs.existsSync(awkPath);
     if (needsAwk) {
       const subDiff = path.join(chunksDir, `_subdiff_${ch.id}.diff`);
-      fs.writeFileSync(subDiff, fileTextByPath.get(ch.files[0].path) || '');
+      let subBody = '';
+      for (const file of ch.files) {
+        const txt = fileTextByPath.get(file.path);
+        if (txt) subBody += txt + (txt.endsWith('\n') ? '' : '\n');
+      }
+      fs.writeFileSync(subDiff, subBody);
       const subOut = path.join(chunksDir, `_subchunks_${ch.id}`);
       fs.mkdirSync(subOut, { recursive: true });
       const r = cp.spawnSync('awk', [
@@ -531,10 +603,15 @@ function emitAstChunks(diffText, files, chunks, chunksDir, chunkSize, awkPath) {
         '-f', awkPath,
       ], { input: fs.readFileSync(subDiff), env: { ...process.env, LC_ALL: 'C' } });
       if (r.status !== 0) {
-        warn(`awk sub-chunk failed for ${ch.files[0].path}; falling back to single chunk`);
+        const label = ch.files.length === 1
+          ? ch.files[0].path
+          : `${ch.files.length} files (${ch.files[0].path}, …)`;
+        warn(`awk sub-chunk failed for ${label}; falling back to single chunk`);
       } else {
         const sub = fs.readFileSync(path.join(subOut, 'chunk_count.txt'), 'utf8').trim();
-        const subN = parseInt(sub, 10) || 1;
+        // awk now reports the true number of files written (count == files);
+        // use 0 as the floor and rely on existence/size guards below.
+        const subN = parseInt(sub, 10) || 0;
         for (let i = 1; i <= subN; i++) {
           const sf = path.join(subOut, `chunk_${String(i).padStart(3, '0')}.diff`);
           if (!fs.existsSync(sf)) continue;
@@ -551,6 +628,12 @@ function emitAstChunks(diffText, files, chunks, chunksDir, chunkSize, awkPath) {
     }
     let body = '';
     for (const file of ch.files) {
+      // Skip files with no reviewable content (binary/rename/mode-only). They
+      // stay in the manifest/file list (built independently in parseDiff) but
+      // carry no diff worth sending to a model. A chunk composed entirely of
+      // such files therefore yields an empty body and is dropped, which feeds
+      // the empty-plan fallback (chunk_count.txt = 0) below.
+      if (hasNoReviewableContent(file)) continue;
       const txt = fileTextByPath.get(file.path);
       if (txt) body += txt + (txt.endsWith('\n') ? '' : '\n');
     }
@@ -559,9 +642,15 @@ function emitAstChunks(diffText, files, chunks, chunksDir, chunkSize, awkPath) {
     fs.writeFileSync(path.join(chunksDir, `chunk_${String(outputIndex).padStart(3, '0')}.diff`), body);
     totalChunks++;
   }
+  // Empty-plan fallback: if nothing reviewable was emitted (e.g. the diff is
+  // entirely binary blobs / pure renames / mode changes), report 0 chunks so
+  // the orchestrator can short-circuit cleanly. review.sh's `seq 1 0` loop
+  // produces no iterations, so a 0 count is handled gracefully there.
+  // (Previously this dumped the entire diff into one chunk, sending unreviewable
+  // content to the models.)
   if (totalChunks === 0) {
-    fs.writeFileSync(path.join(chunksDir, 'chunk_001.diff'), diffText);
-    totalChunks = 1;
+    warn('no LLM-reviewable chunks produced (diff is binary/rename/mode-only); ' +
+         'writing chunk_count.txt=0');
   }
   fs.writeFileSync(path.join(chunksDir, 'chunk_count.txt'), `${totalChunks}\n`);
 }
@@ -615,6 +704,21 @@ function main() {
   };
 
   const hasSupportedLang = files.some(f => detectLanguage(f.path) !== null);
+
+  // Observability for the silent unsupported-language fallthrough: list the
+  // distinct source extensions present that detectLanguage() does not handle,
+  // so users understand why a PR got hunk-mode chunking instead of AST. This
+  // does NOT change the fallback behavior — it only reports it.
+  const unsupportedExts = new Set();
+  for (const f of files) {
+    if (!f.path) continue;
+    if (detectLanguage(f.path) !== null) continue;
+    const ext = path.extname(f.path).toLowerCase();
+    // Skip non-code / extensionless / clearly-data files to keep the notice
+    // focused on languages we could plausibly support.
+    if (CODE_EXTS.has(ext)) unsupportedExts.add(ext);
+  }
+
   let mode = args.chunker;
   let ts = null;
   if (mode === 'ast' || (mode === 'auto' && hasSupportedLang)) {
@@ -629,11 +733,16 @@ function main() {
     mode = 'hunk';
   }
 
+  if (unsupportedExts.size > 0) {
+    warn(`AST chunking does not support these languages present in this PR: ` +
+         `${[...unsupportedExts].sort().join(', ')} — those files use hunk-mode chunking`);
+  }
+
   fs.mkdirSync(args.chunksDir, { recursive: true });
 
   let astChunks = null;
   if (mode === 'ast') {
-    astChunks = planAstChunks(files, args.chunkSize, ts);
+    astChunks = planAstChunks(files, args.chunkSize, ts, args.headSha);
     emitAstChunks(diffText, files, astChunks, args.chunksDir, args.chunkSize, args.awk);
   } else {
     if (fs.existsSync(args.awk)) {
@@ -644,16 +753,26 @@ function main() {
     }
   }
 
-  const totalChunks = parseInt(
+  // Read the count written by the chunker. 0 is a legitimate value (empty-plan
+  // fallback: diff was entirely binary/rename/mode-only) and must NOT be
+  // coerced to 1, or we would fabricate a chunk record for a file that does not
+  // exist. Only a non-numeric/garbage count is treated as unknown (0).
+  const rawCount = parseInt(
     fs.readFileSync(path.join(args.chunksDir, 'chunk_count.txt'), 'utf8').trim(),
     10
-  ) || 1;
+  );
+  const totalChunks = Number.isFinite(rawCount) && rawCount >= 0 ? rawCount : 0;
 
   let chunkRecords = [];
   if (mode === 'ast' && astChunks && astChunks.length === totalChunks) {
+    // Only list files that actually appear in the emitted chunk diff (i.e.
+    // those with reviewable hunks). No-hunk files (binary/rename/mode-only) are
+    // stripped from the chunk body by emitAstChunks, so listing them here would
+    // make chunks[].files disagree with the on-disk diff. They remain in
+    // manifest.files for reporting.
     chunkRecords = astChunks.map((ch, i) => ({
       id: i + 1,
-      files: ch.files.map(f => f.path),
+      files: ch.files.filter(f => !hasNoReviewableContent(f)).map(f => f.path),
       diff_path: path.join(args.chunksDir, `chunk_${String(i + 1).padStart(3, '0')}.diff`),
     }));
   } else {

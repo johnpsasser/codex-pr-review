@@ -12,8 +12,16 @@ BEGIN {
     if (chunk_size == 0) chunk_size = 5000
     if (output_dir == "") output_dir = "/tmp/chunks"
 
+    # Invariant: the count written to chunk_count.txt MUST equal the number of
+    # chunk_NNN.diff files that actually received content. chunk_num is only a
+    # *file-name pointer* (where the next bytes go); it is advanced by
+    # close_chunk() even when the next slot ends up empty. files_written counts
+    # chunks that genuinely got bytes, and is the value reported at END. This
+    # keeps the awk path consistent with plan.js (which reports groups.length).
     chunk_num = 1
     chunk_lines = 0
+    files_written = 0       # number of chunk files that received content
+    chunk_has_content = 0   # did the current chunk_num slot get any bytes yet?
     file_header = ""
     in_hunk = 0
     hunk_buf = ""
@@ -118,11 +126,13 @@ function flush_hunk() {
     if (needs_hunk_header && hunk_header != "") {
         printf "%s\n", hunk_header >> chunk_file()
         chunk_lines += 1
+        mark_content()
         needs_hunk_header = 0
     }
 
     printf "%s", hunk_buf >> chunk_file()
     chunk_lines += hunk_line_count
+    mark_content()
 
     hunk_buf = ""
     hunk_line_count = 0
@@ -140,6 +150,17 @@ function ensure_file_header() {
         chunk_lines += (n - 1)  # split adds empty element after trailing \n
         header_written = 1
         needs_file_header = 0
+        mark_content()
+    }
+}
+
+# Record that the current chunk_num slot has received content. The first byte
+# written to a given slot bumps files_written exactly once, so files_written
+# always equals the number of chunk_NNN.diff files actually emitted.
+function mark_content() {
+    if (!chunk_has_content) {
+        chunk_has_content = 1
+        files_written++
     }
 }
 
@@ -148,11 +169,17 @@ function chunk_file() {
 }
 
 function close_chunk() {
+    # Only advance the file-name pointer if the current slot actually got
+    # content; otherwise close_chunk() would skip a file index and the next
+    # write would land in a higher-numbered file, leaving a gap that breaks
+    # the count == files-written invariant.
+    if (!chunk_has_content) return
     close(chunk_file())
     chunk_num++
     chunk_lines = 0
     header_written = 0
     needs_file_header = 1
+    chunk_has_content = 0
     # needs_hunk_header is set by callers that close mid-hunk; do not blanket
     # clear here because the mid-hunk-split path needs it to remain true.
 }
@@ -166,13 +193,13 @@ END {
         ensure_file_header()
     }
 
-    # Close last chunk
-    if (chunk_lines > 0) {
+    # Close last chunk (the slot only has a file on disk if it got content).
+    if (chunk_has_content) {
         close(chunk_file())
     }
 
-    # Write chunk count
+    # Write chunk count == number of files actually written (the invariant).
     count_file = output_dir "/chunk_count.txt"
-    print chunk_num > count_file
+    print files_written > count_file
     close(count_file)
 }

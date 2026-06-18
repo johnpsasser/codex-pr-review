@@ -10,6 +10,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR=$(mktemp -d)
+# Minimal cleanup until the full trap (with failure preservation) is installed
+# below — guards the window between mktemp and that trap against a leaked dir.
+trap 'rm -rf "$WORK_DIR"' EXIT
 FAILURE_DIR=""   # populated by preserve_chunk_failures when there are any
 
 cleanup_work_dir() {
@@ -177,6 +180,12 @@ MODEL_VERIFIER="claude-opus-4-7"    # default cross-family verifier model.
 # reverse), which combined with the threshold filter to drop every unconfirmed
 # finding. Defaulting to Opus 4.7 trades cost for accuracy on the verifier
 # step. Override with --model-verifier claude-haiku-4-5 to revert.
+#
+# Escalation model: when a primary verifier returns `inconclusive` (or fails),
+# the finding is re-verified with this stronger model on the Claude side. Named
+# here (env-overridable) rather than hardcoded at the call site so the Haiku→Opus
+# upgrade path is discoverable. Defaults to Opus 4.7.
+MODEL_VERIFIER_ESCALATION="${MODEL_VERIFIER_ESCALATION:-claude-opus-4-7}"
 
 # v2 additions (P3): deterministic floor (lint/typecheck/tests on changed
 # lines). Enabled by default; --no-deterministic disables it. The flag is
@@ -378,11 +387,21 @@ detect_pr() {
   local pr_json
 
   if [[ -n "$PR_ARG" ]]; then
-    # Extract number from URL if needed
+    # Resolve the PR reference. Accept a bare number, a GitHub PR URL
+    # (.../pull/<N>[/files | #issuecomment-<M> | ...]), or anything else that
+    # `gh pr view` itself can resolve (full URL, branch name). The old
+    # `grep -oE '[0-9]+$'` grabbed *trailing* digits, so a URL ending in
+    # `/files` or `#issuecomment-99` silently selected the wrong PR.
     local pr_num
-    pr_num=$(echo "$PR_ARG" | grep -oE '[0-9]+$' || echo "$PR_ARG")
+    if [[ "$PR_ARG" =~ ^[0-9]+$ ]]; then
+      pr_num="$PR_ARG"
+    elif [[ "$PR_ARG" =~ /pull/([0-9]+) ]]; then
+      pr_num="${BASH_REMATCH[1]}"
+    else
+      pr_num="$PR_ARG"   # let gh resolve a full URL or branch name as-is
+    fi
     pr_json=$(gh pr view "$pr_num" --json number,title,headRefName,headRefOid,baseRefName,url 2>/dev/null) || {
-      echo "Error: Could not find PR #$pr_num" >&2
+      echo "Error: Could not find PR '$pr_num'" >&2
       exit 2
     }
   else
@@ -1005,15 +1024,15 @@ build_prompt() {
   # Single-review path has no chunks → no neighbors.
   local neighbors_content="_No cross-chunk neighbors (single-review path)._"
 
-  # Use sed for small single-line placeholders (BSD sed can't handle newlines
-  # in replacement text, so multi-line values go through perl below).
-  LC_ALL=C sed \
-    -e "s|{{PR_NUMBER}}|${pr_number}|g" \
-    -e "s|{{PR_TITLE}}|${pr_title}|g" \
-    -e "s|{{HEAD_BRANCH}}|${head_branch}|g" \
-    -e "s|{{BASE_BRANCH}}|${base_branch}|g" \
-    "$SCRIPT_DIR/codex-prompt.md" > "$WORK_DIR/_prompt_template_pre.md"
-
+  # All placeholders go through perl with values passed via the environment and
+  # matched with \Q...\E. This is injection-safe: the replacement is the literal
+  # variable value (no re-interpolation), so a PR title or branch name containing
+  # `|`, `&`, `\`, or `/` can't corrupt the substitution the way `sed s|..|..|`
+  # would. perl also handles multi-line replacement values.
+  PR_NUMBER_VAL="$pr_number" \
+  PR_TITLE_VAL="$pr_title" \
+  HEAD_BRANCH_VAL="$head_branch" \
+  BASE_BRANCH_VAL="$base_branch" \
   PROJECT_RULES_VAL="$project_rules_section" \
   PRIOR_REVIEW_VAL="$followup_context" \
   MANIFEST_VAL="$manifest_content" \
@@ -1021,18 +1040,26 @@ build_prompt() {
   NEIGHBORS_VAL="$neighbors_content" \
   perl -pe '
     BEGIN {
+      $pn  = $ENV{PR_NUMBER_VAL};
+      $pt  = $ENV{PR_TITLE_VAL};
+      $hb  = $ENV{HEAD_BRANCH_VAL};
+      $bb  = $ENV{BASE_BRANCH_VAL};
       $pr  = $ENV{PROJECT_RULES_VAL};
       $prv = $ENV{PRIOR_REVIEW_VAL};
       $mf  = $ENV{MANIFEST_VAL};
       $rr  = $ENV{REVIEW_RULES_VAL};
       $nb  = $ENV{NEIGHBORS_VAL};
     }
+    s/\Q{{PR_NUMBER}}\E/$pn/g;
+    s/\Q{{PR_TITLE}}\E/$pt/g;
+    s/\Q{{HEAD_BRANCH}}\E/$hb/g;
+    s/\Q{{BASE_BRANCH}}\E/$bb/g;
     s/\Q{{PROJECT_RULES}}\E/$pr/g;
     s/\Q{{PRIOR_REVIEW}}\E/$prv/g;
     s/\Q{{MANIFEST}}\E/$mf/g;
     s/\Q{{REVIEW_RULES}}\E/$rr/g;
     s/\Q{{NEIGHBORS}}\E/$nb/g;
-  ' "$WORK_DIR/_prompt_template_pre.md" > "$WORK_DIR/_prompt_template.md"
+  ' "$SCRIPT_DIR/codex-prompt.md" > "$WORK_DIR/_prompt_template.md"
 
   # Split on {{DIFF}} line and splice diff file in between
   local line_num
@@ -1091,18 +1118,18 @@ _build_chunk_prompt_for_family() {
     neighbors_content="_No cross-chunk neighbors detected._"
   fi
 
-  local pre_file="$WORK_DIR/_chunk_template_pre_${family}_${chunk_num}.md"
   local mid_file="$WORK_DIR/_chunk_template_${family}_${chunk_num}.md"
 
-  LC_ALL=C sed \
-    -e "s|{{PR_NUMBER}}|${pr_number}|g" \
-    -e "s|{{PR_TITLE}}|${pr_title}|g" \
-    -e "s|{{HEAD_BRANCH}}|${head_branch}|g" \
-    -e "s|{{BASE_BRANCH}}|${base_branch}|g" \
-    -e "s|{{CHUNK_NUM}}|${chunk_num}|g" \
-    -e "s|{{TOTAL_CHUNKS}}|${total_chunks}|g" \
-    "$template_path" > "$pre_file"
-
+  # Injection-safe substitution: all values go through perl via the environment
+  # with \Q...\E matching, so a PR title / branch name with shell- or
+  # sed-significant characters can't corrupt the template. (CHUNK_NUM /
+  # TOTAL_CHUNKS are numeric but folded in here for uniformity.)
+  PR_NUMBER_VAL="$pr_number" \
+  PR_TITLE_VAL="$pr_title" \
+  HEAD_BRANCH_VAL="$head_branch" \
+  BASE_BRANCH_VAL="$base_branch" \
+  CHUNK_NUM_VAL="$chunk_num" \
+  TOTAL_CHUNKS_VAL="$total_chunks" \
   PROJECT_RULES_VAL="$project_rules_section" \
   PRIOR_REVIEW_VAL="$followup_context" \
   MANIFEST_VAL="$manifest_content" \
@@ -1110,18 +1137,30 @@ _build_chunk_prompt_for_family() {
   NEIGHBORS_VAL="$neighbors_content" \
   perl -pe '
     BEGIN {
+      $pn  = $ENV{PR_NUMBER_VAL};
+      $pt  = $ENV{PR_TITLE_VAL};
+      $hb  = $ENV{HEAD_BRANCH_VAL};
+      $bb  = $ENV{BASE_BRANCH_VAL};
+      $cn  = $ENV{CHUNK_NUM_VAL};
+      $tc  = $ENV{TOTAL_CHUNKS_VAL};
       $pr  = $ENV{PROJECT_RULES_VAL};
       $prv = $ENV{PRIOR_REVIEW_VAL};
       $mf  = $ENV{MANIFEST_VAL};
       $rr  = $ENV{REVIEW_RULES_VAL};
       $nb  = $ENV{NEIGHBORS_VAL};
     }
+    s/\Q{{PR_NUMBER}}\E/$pn/g;
+    s/\Q{{PR_TITLE}}\E/$pt/g;
+    s/\Q{{HEAD_BRANCH}}\E/$hb/g;
+    s/\Q{{BASE_BRANCH}}\E/$bb/g;
+    s/\Q{{CHUNK_NUM}}\E/$cn/g;
+    s/\Q{{TOTAL_CHUNKS}}\E/$tc/g;
     s/\Q{{PROJECT_RULES}}\E/$pr/g;
     s/\Q{{PRIOR_REVIEW}}\E/$prv/g;
     s/\Q{{MANIFEST}}\E/$mf/g;
     s/\Q{{REVIEW_RULES}}\E/$rr/g;
     s/\Q{{NEIGHBORS}}\E/$nb/g;
-  ' "$pre_file" > "$mid_file"
+  ' "$template_path" > "$mid_file"
 
   local line_num
   line_num=$(grep -n '{{DIFF}}' "$mid_file" | head -1 | cut -d: -f1)
@@ -1156,14 +1195,31 @@ build_synthesis_prompt() {
   local diff_file="$8"  # path to full raw diff file
   local output_file="$9"  # path to write filled prompt
 
-  LC_ALL=C sed \
-    -e "s|{{PRIOR_REVIEW}}|${followup_context}|g" \
-    -e "s|{{PR_NUMBER}}|${pr_number}|g" \
-    -e "s|{{PR_TITLE}}|${pr_title}|g" \
-    -e "s|{{HEAD_BRANCH}}|${head_branch}|g" \
-    -e "s|{{BASE_BRANCH}}|${base_branch}|g" \
-    -e "s|{{TOTAL_CHUNKS}}|${total_chunks}|g" \
-    "$SCRIPT_DIR/codex-synthesis-prompt.md" > "$WORK_DIR/_synthesis_template.md"
+  # Injection-safe substitution via perl + environment (\Q...\E matching). Also
+  # fixes a latent bug: {{PRIOR_REVIEW}} carries multi-line follow-up context,
+  # which BSD sed cannot place in a replacement.
+  PRIOR_REVIEW_VAL="$followup_context" \
+  PR_NUMBER_VAL="$pr_number" \
+  PR_TITLE_VAL="$pr_title" \
+  HEAD_BRANCH_VAL="$head_branch" \
+  BASE_BRANCH_VAL="$base_branch" \
+  TOTAL_CHUNKS_VAL="$total_chunks" \
+  perl -pe '
+    BEGIN {
+      $prv = $ENV{PRIOR_REVIEW_VAL};
+      $pn  = $ENV{PR_NUMBER_VAL};
+      $pt  = $ENV{PR_TITLE_VAL};
+      $hb  = $ENV{HEAD_BRANCH_VAL};
+      $bb  = $ENV{BASE_BRANCH_VAL};
+      $tc  = $ENV{TOTAL_CHUNKS_VAL};
+    }
+    s/\Q{{PRIOR_REVIEW}}\E/$prv/g;
+    s/\Q{{PR_NUMBER}}\E/$pn/g;
+    s/\Q{{PR_TITLE}}\E/$pt/g;
+    s/\Q{{HEAD_BRANCH}}\E/$hb/g;
+    s/\Q{{BASE_BRANCH}}\E/$bb/g;
+    s/\Q{{TOTAL_CHUNKS}}\E/$tc/g;
+  ' "$SCRIPT_DIR/codex-synthesis-prompt.md" > "$WORK_DIR/_synthesis_template.md"
 
   # Splice chunk results at {{CHUNK_RESULTS}}
   local line_num
@@ -1484,6 +1540,7 @@ run_chunked_review() {
 
     if [[ "$should_try_ast" -eq 1 && -x "$SCRIPT_DIR/ast-chunk.sh" ]]; then
       if PLAN_JSON_OUT="$WORK_DIR/plan.json" AST_CHUNKER="$CHUNKER" \
+          AST_HEAD_SHA="${PR_HEAD_SHA:-}" \
           bash "$SCRIPT_DIR/ast-chunk.sh" "$CHUNK_SIZE" "$chunk_dir" \
           < "$diff_file" 2>"$WORK_DIR/ast-chunk-stderr.log"; then
         used_ast=1
@@ -1497,14 +1554,32 @@ run_chunked_review() {
     fi
 
     if [[ "$used_ast" -ne 1 ]]; then
-      LC_ALL=C awk -v chunk_size="$CHUNK_SIZE" -v output_dir="$chunk_dir" \
-        -f "$SCRIPT_DIR/chunk-diff.awk" < "$diff_file"
+      if ! LC_ALL=C awk -v chunk_size="$CHUNK_SIZE" -v output_dir="$chunk_dir" \
+          -f "$SCRIPT_DIR/chunk-diff.awk" < "$diff_file" 2>"$WORK_DIR/awk-chunk-stderr.log"; then
+        echo "Error: AWK chunker failed." >&2
+        [[ -s "$WORK_DIR/awk-chunk-stderr.log" ]] && \
+          sed -e 's/^/  /' "$WORK_DIR/awk-chunk-stderr.log" >&2 || true
+        exit 3
+      fi
     fi
   fi
 
   local total_chunks
-  total_chunks=$(cat "$chunk_dir/chunk_count.txt")
+  if [[ ! -f "$chunk_dir/chunk_count.txt" ]]; then
+    echo "Error: chunker produced no chunk_count.txt." >&2
+    exit 3
+  fi
+  total_chunks=$(tr -d '[:space:]' < "$chunk_dir/chunk_count.txt")
+  if [[ ! "$total_chunks" =~ ^[0-9]+$ ]]; then
+    echo "Error: chunker emitted a non-numeric chunk count: '$total_chunks'." >&2
+    exit 3
+  fi
   echo "Split into $total_chunks chunks (mode: $([ "$used_ast" -eq 1 ] && echo ast || echo hunk))." >&2
+
+  if [[ "$total_chunks" -eq 0 ]]; then
+    echo "Error: PR diff contained no reviewable chunks (binary/rename-only?)." >&2
+    exit 2
+  fi
 
   # If chunking produced only 1 chunk AND v2 dual-family is unavailable, fall
   # back to single review (Codex-only). When v2 is available the chunked path
@@ -1636,7 +1711,9 @@ run_chunked_review() {
     if [[ "$det_count" -gt 0 ]]; then
       echo "Merging $det_count deterministic findings into synthesis input..." >&2
       local combined_file="$WORK_DIR/merged-findings-with-det.json"
-      jq -s '
+      # Only overwrite merged_file if the merge produced valid JSON — otherwise a
+      # jq error would clobber the LLM findings with a truncated/empty file.
+      if jq -s '
         def keyof(f): (f.code_location.path // "") + "|" + ((f.code_location.start_line // 0)|tostring) + "|" + (f.title // "");
         # .[0] = LLM merged-findings, .[1] = deterministic findings.
         # Deterministic findings come first (so they sort above LLM at equal
@@ -1644,8 +1721,12 @@ run_chunked_review() {
         # when both an LLM and a deterministic finding share the same key.
         (.[1] + .[0])
         | unique_by(keyof(.))
-      ' "$merged_file" "$det_file" > "$combined_file"
-      mv "$combined_file" "$merged_file"
+      ' "$merged_file" "$det_file" > "$combined_file" 2>/dev/null \
+         && jq empty "$combined_file" 2>/dev/null; then
+        mv "$combined_file" "$merged_file"
+      else
+        echo "Warning: deterministic merge failed; keeping LLM findings unmerged." >&2
+      fi
     fi
   fi
 
@@ -1778,6 +1859,13 @@ _run_codex_verifier() {
     --output-schema "$SCRIPT_DIR/verifier-output-schema.json" \
     --sandbox read-only \
     - < "$prompt_file" > "$out_file" 2>"$stderr_log"; then
+    # Codex writes the schema-conformant object directly today, but defend
+    # against a future envelope (same class of bug that broke the Claude side
+    # when it moved output to `.structured_output`): unwrap it if present.
+    if jq empty "$out_file" 2>/dev/null \
+       && jq -e '.structured_output | type == "object"' "$out_file" >/dev/null 2>&1; then
+      jq '.structured_output' "$out_file" > "$out_file.tmp" && mv "$out_file.tmp" "$out_file"
+    fi
     if jq -e '.verdict and .evidence and (.adjusted_confidence != null)' "$out_file" >/dev/null 2>&1; then
       return 0
     fi
@@ -1847,8 +1935,10 @@ _extract_diff_hunk() {
     }
     /^@@ / {
       if (!in_file) next
-      # Save the prior hunk if it covered start
-      if (in_hunk && new_start <= start && start <= new_start + new_count) {
+      # Save the prior hunk if it covered start. The hunk spans new-file lines
+      # [new_start, new_start + new_count - 1] inclusive, so the upper bound is
+      # new_count - 1 (using new_count alone over-reaches by one line).
+      if (in_hunk && new_start <= start && start <= new_start + new_count - 1) {
         matched = buf
       }
       buf = $0 "\n"
@@ -1866,7 +1956,7 @@ _extract_diff_hunk() {
       if (in_file && in_hunk) buf = buf $0 "\n"
     }
     END {
-      if (in_file && in_hunk && new_start <= start && start <= new_start + new_count) {
+      if (in_file && in_hunk && new_start <= start && start <= new_start + new_count - 1) {
         matched = buf
       }
       if (matched != "") { printf "%s", matched }
@@ -2067,7 +2157,7 @@ run_cross_family_verifier() {
         local escalated_verdict_file="$WORK_DIR/verifier/finding-${fid}-verdict-escalated.json"
         local escalated_stderr_log="$WORK_DIR/verifier/finding-${fid}-stderr-escalated.log"
         if [[ "$source" == "codex" ]]; then
-          if _run_claude_verifier "$prompt_file" "$escalated_verdict_file" "$escalated_stderr_log" "claude-opus-4-7"; then
+          if _run_claude_verifier "$prompt_file" "$escalated_verdict_file" "$escalated_stderr_log" "$MODEL_VERIFIER_ESCALATION"; then
             mv "$escalated_verdict_file" "$verdict_file"
             verifier_ok=1
             verdict=$(jq -r '.verdict // "inconclusive"' "$verdict_file" 2>/dev/null || echo "inconclusive")
@@ -2319,9 +2409,11 @@ format_comment() {
   filtered_count=$(jq --arg t "$THRESHOLD" '[.findings[] | select(((.original_confidence_score // .confidence_score) // 0) >= ($t | tonumber))] | length' "$output_file")
 
   local verdict confidence_score explanation
-  verdict=$(jq -r '.overall_correctness' "$output_file")
-  confidence_score=$(jq -r '.overall_confidence_score' "$output_file")
-  explanation=$(jq -r '.overall_explanation' "$output_file")
+  # Default missing fields rather than rendering the literal string "null" (which
+  # is what `jq -r` emits for an absent key) into the verdict / sentinel.
+  verdict=$(jq -r '.overall_correctness // "insufficient information"' "$output_file")
+  confidence_score=$(jq -r '.overall_confidence_score // 0' "$output_file")
+  explanation=$(jq -r '.overall_explanation // ""' "$output_file")
 
   # v1 → v2 verdict shim. Required so a v1-shaped synthesis output flowing
   # through v2 format_comment renders the v2 enum verbatim. Spec §11.
@@ -2526,9 +2618,13 @@ format_comment() {
   # Warn about incomplete coverage if any chunks failed during chunked review.
   if [[ -f "$WORK_DIR/chunk-stats.txt" ]]; then
     local stats_succeeded stats_failed
-    stats_succeeded=$(sed -n '1p' "$WORK_DIR/chunk-stats.txt")
-    stats_failed=$(sed -n '2p' "$WORK_DIR/chunk-stats.txt")
-    if [[ "$stats_failed" -gt 0 ]]; then
+    # Strip to digits so a malformed/empty stats file can't abort the run with an
+    # arithmetic error *after* a successful review, right before we post.
+    stats_succeeded=$(sed -n '1p' "$WORK_DIR/chunk-stats.txt" | tr -dc '0-9')
+    stats_failed=$(sed -n '2p' "$WORK_DIR/chunk-stats.txt" | tr -dc '0-9')
+    stats_succeeded="${stats_succeeded:-0}"
+    stats_failed="${stats_failed:-0}"
+    if (( stats_failed > 0 )); then
       local total_c=$((stats_succeeded + stats_failed))
       comment+=$'\n'"> ⚠️ **Incomplete coverage:** ${stats_failed} of ${total_c} chunks failed during review. Findings reflect only the ${stats_succeeded} successful chunks. Consider retrying or reducing \`--max-parallel\`."$'\n'
     fi
@@ -2541,7 +2637,12 @@ format_comment() {
   comment+=$'\n'"*Reviewed by codex-pr-review v2 (codex=$MODEL_CODEX, claude=$MODEL_CLAUDE)${iteration_label} | Threshold: $THRESHOLD | $total_findings total findings, $filtered_count reported*"
 
   # ── v2 sentinel (compact, machine-parseable; primary in v2) ──────────────
-  comment+=$'\n\n'"<!-- codex-pr-review:meta v=2 sha=${head_sha} iteration=${review_iteration} findings=${filtered_count} verdict=${verdict} mode=${iter_mode} prior_sha=${iter_prior_sha} -->"
+  # Strip angle brackets from model-derived fields so a stray `-->` can't close
+  # the HTML comment early and permanently break prior-review re-discovery.
+  local sentinel_verdict sentinel_mode
+  sentinel_verdict=$(printf '%s' "$verdict" | tr -d '<>')
+  sentinel_mode=$(printf '%s' "$iter_mode" | tr -d '<>')
+  comment+=$'\n\n'"<!-- codex-pr-review:meta v=2 sha=${head_sha} iteration=${review_iteration} findings=${filtered_count} verdict=${sentinel_verdict} mode=${sentinel_mode} prior_sha=${iter_prior_sha} -->"
 
   # ── Legacy CODEX_REVIEW_DATA_START block (v1 rollback). Preserved per spec
   # §11; allows a v2→v1 downgrade to keep the iteration counter.
@@ -2645,16 +2746,24 @@ main() {
   # Gather diff — write directly to file to avoid storing huge diffs in bash variables
   echo "Gathering diff..." >&2
   local diff_file="$WORK_DIR/full-diff.txt"
-  gh pr diff "$pr_number" > "$diff_file" 2>/dev/null || true
+  local gh_diff_err="$WORK_DIR/gh-pr-diff-stderr.log"
+  gh pr diff "$pr_number" > "$diff_file" 2>"$gh_diff_err" || true
 
   if [[ ! -s "$diff_file" ]]; then
-    echo "  gh pr diff failed (diff may be too large for GitHub API). Falling back to git diff..." >&2
+    echo "  gh pr diff failed (diff may be too large for the GitHub API, or auth/rate-limit). Falling back to git diff..." >&2
+    [[ -s "$gh_diff_err" ]] && sed -e 's/^/    gh: /' "$gh_diff_err" >&2 || true
     git fetch origin "$base_branch" "$head_branch" 2>/dev/null || true
+    # Three-dot: diff from the merge-base of base & head to head — matches what
+    # GitHub's PR "Files changed" view shows. (Two-dot would wrongly fold in
+    # commits that are on base but not head.)
     git diff "origin/${base_branch}...origin/${head_branch}" > "$diff_file" 2>/dev/null || true
   fi
 
   if [[ ! -s "$diff_file" ]]; then
-    echo "Error: PR diff is empty." >&2
+    echo "Error: PR diff is empty. Possible causes:" >&2
+    echo "  - no commits between '$base_branch' and '$head_branch'" >&2
+    echo "  - the base branch isn't fetched locally (try: git fetch origin $base_branch)" >&2
+    echo "  - gh is not authenticated for this repo (try: gh auth status)" >&2
     exit 2
   fi
 
@@ -2850,7 +2959,7 @@ main() {
   total_findings=$(jq '.findings | length' "$WORK_DIR/codex-output.json")
   filtered_count=$(jq --arg t "$THRESHOLD" '[.findings[] | select(((.original_confidence_score // .confidence_score) // 0) >= ($t | tonumber))] | length' "$WORK_DIR/codex-output.json")
   resolved_count=$(jq '[.resolved_prior_findings // [] | length] | .[0]' "$WORK_DIR/codex-output.json")
-  raw_verdict=$(jq -r '.overall_correctness' "$WORK_DIR/codex-output.json")
+  raw_verdict=$(jq -r '.overall_correctness // "insufficient information"' "$WORK_DIR/codex-output.json")
   # Same v1→v2 verdict shim format_comment uses (kept consistent).
   v2_verdict=$(echo "$raw_verdict" | sed 's/patch is correct/correct/; s/patch is incorrect/needs-changes/')
 

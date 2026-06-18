@@ -11,6 +11,8 @@
 # Optional env:
 #   PLAN_JSON_OUT   Path for plan.json output (default: <output_dir>/../plan.json)
 #   AST_CHUNKER     Forces a specific mode: auto (default) | ast | hunk
+#   AST_HEAD_SHA    Git SHA to read file content from for AST parsing (PR head).
+#                   plan.js falls back to the working tree if the SHA is absent.
 #
 # On any failure, exits non-zero. The caller (review.sh) should fall back to
 # the awk chunker on non-zero exit and emit a stderr warning.
@@ -46,13 +48,19 @@ tmp_diff="$(mktemp -t ast-chunk.XXXXXX.diff)"
 trap 'rm -f "$tmp_diff"' EXIT
 cat > "$tmp_diff"
 
+head_sha_args=()
+if [[ -n "${AST_HEAD_SHA:-}" ]]; then
+  head_sha_args=(--head-sha "$AST_HEAD_SHA")
+fi
+
 node "$plan_js" \
   --diff "$tmp_diff" \
   --chunk-size "$chunk_size" \
   --chunks-dir "$output_dir" \
   --output "$plan_out" \
   --chunker "$mode" \
-  --awk "$awk_script"
+  --awk "$awk_script" \
+  ${head_sha_args[@]+"${head_sha_args[@]}"}
 
 # Verify contract.
 if [[ ! -f "$output_dir/chunk_count.txt" ]]; then
