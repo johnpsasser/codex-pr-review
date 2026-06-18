@@ -1,0 +1,8 @@
+{
+  "name": "codex-pr-review",
+  "description": "Review a pull request using a dual-family pipeline (OpenAI Codex + Claude Opus) with a cross-family grounded verifier and a deterministic lint/typecheck/test floor. Supports auto-detection of the current branch PR or an explicit PR number/URL.",
+  "version": "2.0.0",
+  "author": {
+    "name": "John P. Sasser"
+  }
+}
