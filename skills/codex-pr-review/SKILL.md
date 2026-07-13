@@ -11,7 +11,7 @@ argument-hint: "[PR_NUMBER|PR_URL] [--mode auto|initial|followup|delta] [--thres
 
 # Codex PR Review (v2)
 
-Review a pull request using a dual-family pipeline — Codex (`gpt-5.3-codex`) and Claude Opus run in parallel per chunk — with every LLM finding independently verified against source code by the *other* family before posting. A deterministic floor (lint + typecheck + tests on changed lines) anchors the LLM panel in real tool exit codes.
+Review a pull request using a dual-family pipeline — Codex (`gpt-5.6-sol`) and Claude Opus run in parallel per chunk — with every LLM finding independently verified against source code by the *other* family before posting. A deterministic floor (lint + typecheck + tests on changed lines) anchors the LLM panel in real tool exit codes.
 
 ## Prerequisites
 
@@ -43,9 +43,9 @@ Review a pull request using a dual-family pipeline — Codex (`gpt-5.3-codex`) a
 | `PR_NUMBER` or `PR_URL` | auto-detect | PR to review |
 | `--mode` | `auto` | `auto`, `initial`, `followup`, or `delta` (forces iteration mode) |
 | `--threshold` | `0.8` | Confidence threshold (post-verifier) |
-| `--model-codex` (alias `--model`) | `gpt-5.3-codex` | Codex reviewer model |
-| `--model-claude` | `claude-opus-4-7` | Claude reviewer + synthesizer model |
-| `--model-verifier` | `claude-opus-4-7` | Default cross-family verifier model. Override with `claude-haiku-4-5` for cheaper but more deferential verification |
+| `--model-codex` (alias `--model`) | `gpt-5.6-sol` | Codex reviewer model |
+| `--model-claude` | `claude-opus-4-8` | Claude reviewer + synthesizer model |
+| `--model-verifier` | `claude-opus-4-8` | Default cross-family verifier model. Override with `claude-haiku-4-5` for cheaper but more deferential verification |
 | `--chunker` | `auto` | `auto` (AST when language is supported, hunk fallback), `ast`, or `hunk` |
 | `--review-rules` | (auto) | Path to override REVIEW.md / CLAUDE.md discovery |
 | `--chunk-size` | `3000` | Lines per chunk |
@@ -61,7 +61,7 @@ PRs whose diff exceeds `--chunk-size` are split into chunks and reviewed in para
 
 1. The diff is split using **AST-aware chunking** for Python / TypeScript / Go (chunks snap to function/class boundaries) or hunk-aware AWK chunking for everything else. Set `--chunker hunk` to force the legacy AWK splitter; `--chunker ast` to force AST.
 2. Each chunk is reviewed twice in parallel — once by Codex (`codex exec`) and once by Claude (`claude --print`). Both reviewers see the same chunk plus a per-chunk *neighbors* manifest (cross-chunk symbol index) so they don't false-flag forward references as "undefined."
-3. Every LLM finding is then verified by the *other* family (Claude — Opus 4.7 by default, `--model-verifier claude-haiku-4-5` for a cheaper run — verifies Codex findings; Codex CLI verifies Claude findings). Refuted findings are dropped; inconclusive findings are escalated to Opus and posted as `[unconfirmed-by-X]` if the escalation also can't confirm.
+3. Every LLM finding is then verified by the *other* family (Claude — Opus 4.8 by default, `--model-verifier claude-haiku-4-5` for a cheaper run — verifies Codex findings; Codex CLI verifies Claude findings). Refuted findings are dropped; inconclusive findings are escalated to Opus and posted as `[unconfirmed-by-X]` if the escalation also can't confirm.
 4. A final synthesis step (Claude Opus by default) deduplicates, generates per-finding suggested fixes, and produces the merged comment.
 
 ## v2 — Cross-family verification, deterministic floor, iteration modes

@@ -1,6 +1,6 @@
 # Codex PR Review
 
-A Claude Code skill that reviews pull requests using a **dual-family** AI pipeline — OpenAI Codex (`gpt-5.3-codex`) and Claude Opus run in parallel — with every LLM finding independently verified against source code by the *other* family before being posted. A deterministic floor (lint + typecheck + tests on changed lines) anchors the LLM panel in real tool exit codes.
+A Claude Code skill that reviews pull requests using a **dual-family** AI pipeline — OpenAI Codex (`gpt-5.6-sol`) and Claude Opus run in parallel — with every LLM finding independently verified against source code by the *other* family before being posted. A deterministic floor (lint + typecheck + tests on changed lines) anchors the LLM panel in real tool exit codes.
 
 ## What It Does
 
@@ -10,7 +10,7 @@ When you run `/codex-pr-review`, the skill:
 2. Builds an AST-aware plan + manifest of files, symbols, and per-chunk neighbors so the reviewers don't false-flag forward references.
 3. Runs the deterministic floor (lint / typecheck / tests on changed lines) in parallel with the LLM fan-out.
 4. For each chunk, runs Codex and Claude in parallel against identical prompts and a structured output schema.
-5. For every LLM finding, runs the *other* family's grounded verifier (Claude — Opus 4.7 by default, override with `--model-verifier claude-haiku-4-5` — for Codex findings; Codex CLI for Claude findings). Refuted findings are dropped; inconclusive findings are escalated to Opus then posted with `[unconfirmed]`.
+5. For every LLM finding, runs the *other* family's grounded verifier (Claude — Opus 4.8 by default, override with `--model-verifier claude-haiku-4-5` — for Codex findings; Codex CLI for Claude findings). Refuted findings are dropped; inconclusive findings are escalated to Opus then posted with `[unconfirmed]`.
 6. Synthesizes the merged finding list (deduplicate, label agreement, generate suggested fix per finding, compute v2 verdict).
 7. Validates locations deterministically — drops findings whose `(file, line)` does not resolve in the diff (with a maintainability exception for unchanged-but-related lines).
 8. Posts a single PR comment with three sections: **Resolved since last review** / **Findings** / **Persisting from prior review**.
@@ -55,9 +55,9 @@ Then restart Claude Code.
 | `PR_NUMBER` or `PR_URL` | auto-detect | PR to review |
 | `--mode` | `auto` | `auto`, `initial`, `followup`, or `delta` |
 | `--threshold` | `0.8` | Confidence threshold (post-verifier) |
-| `--model-codex` (alias `--model`) | `gpt-5.3-codex` | Codex reviewer model |
-| `--model-claude` | `claude-opus-4-7` | Claude reviewer + synthesizer model |
-| `--model-verifier` | `claude-opus-4-7` | Default cross-family verifier (override with `claude-haiku-4-5` for cheaper, more deferential verification) |
+| `--model-codex` (alias `--model`) | `gpt-5.6-sol` | Codex reviewer model |
+| `--model-claude` | `claude-opus-4-8` | Claude reviewer + synthesizer model |
+| `--model-verifier` | `claude-opus-4-8` | Default cross-family verifier (override with `claude-haiku-4-5` for cheaper, more deferential verification) |
 | `--chunker` | `auto` | `auto`, `ast`, or `hunk` |
 | `--review-rules` | (auto) | Path to override REVIEW.md / CLAUDE.md discovery |
 | `--chunk-size` | `3000` | Lines per chunk |
@@ -98,7 +98,7 @@ Then restart Claude Code.
 - [persisting] [P2] `api/handler.go:88` — same nil deref, not addressed.
 
 ---
-*Reviewed by codex-pr-review v2 (codex=gpt-5.3-codex, claude=claude-opus-4-7) | Threshold: 0.8 | 4 total findings, 3 reported*
+*Reviewed by codex-pr-review v2 (codex=gpt-5.6-sol, claude=claude-opus-4-8) | Threshold: 0.8 | 4 total findings, 3 reported*
 
 <!-- codex-pr-review:meta v=2 sha=abc123 iteration=2 findings=3 verdict=needs-changes mode=followup-after-fixes prior_sha=def456 -->
 ```
