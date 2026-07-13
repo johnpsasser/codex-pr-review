@@ -5,6 +5,14 @@
 Post-2.0.0 correctness fixes to the verifier, confidence threading, and the
 installer/docs.
 
+### Changed
+
+- **Default models bumped to the current generation.** The Codex reviewer now
+  defaults to `gpt-5.6-sol` (was `gpt-5.3-codex`), and the Claude reviewer,
+  verifier, and escalation verifier now default to `claude-opus-4-8` (was
+  `claude-opus-4-7`). All remain overridable via `--model-codex`,
+  `--model-claude`, and `--model-verifier`.
+
 ### Fixes
 
 - **Verifier reads files at the PR head SHA, not local HEAD.** The cross-family

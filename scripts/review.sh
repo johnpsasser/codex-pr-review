@@ -156,7 +156,7 @@ trap cleanup_work_dir EXIT
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 THRESHOLD="0.8"
-MODEL="gpt-5.3-codex"
+MODEL="gpt-5.6-sol"
 MAX_DIFF_LINES="0"   # 0 = unlimited; chunking handles arbitrarily large diffs
 CHUNK_SIZE="3000"
 # v2 P2: lowered from 6 → 4 because each slot now runs Codex AND Claude in
@@ -169,23 +169,23 @@ PR_ARG=""
 # v2 additions (P1):
 CHUNKER="auto"           # auto | ast | hunk
 REVIEW_RULES_ARG=""      # path to override REVIEW.md / CLAUDE.md
-MODEL_CODEX="gpt-5.3-codex"
-MODEL_CLAUDE="claude-opus-4-7"
+MODEL_CODEX="gpt-5.6-sol"
+MODEL_CLAUDE="claude-opus-4-8"
 
 # v2 additions (P2):
-MODEL_VERIFIER="claude-opus-4-7"    # default cross-family verifier model.
-# Spec §10 ("Verifier deference") originally proposed Haiku 4.5 with Opus 4.7
+MODEL_VERIFIER="claude-opus-4-8"    # default cross-family verifier model.
+# Spec §10 ("Verifier deference") originally proposed Haiku 4.5 with Opus 4.8
 # escalation on inconclusive verdicts. Live testing on a 35K-line PR showed
 # Haiku 4.5 returning 100% inconclusive (the deference failure mode in
 # reverse), which combined with the threshold filter to drop every unconfirmed
-# finding. Defaulting to Opus 4.7 trades cost for accuracy on the verifier
+# finding. Defaulting to Opus 4.8 trades cost for accuracy on the verifier
 # step. Override with --model-verifier claude-haiku-4-5 to revert.
 #
 # Escalation model: when a primary verifier returns `inconclusive` (or fails),
 # the finding is re-verified with this stronger model on the Claude side. Named
 # here (env-overridable) rather than hardcoded at the call site so the Haiku→Opus
-# upgrade path is discoverable. Defaults to Opus 4.7.
-MODEL_VERIFIER_ESCALATION="${MODEL_VERIFIER_ESCALATION:-claude-opus-4-7}"
+# upgrade path is discoverable. Defaults to Opus 4.8.
+MODEL_VERIFIER_ESCALATION="${MODEL_VERIFIER_ESCALATION:-claude-opus-4-8}"
 
 # v2 additions (P3): deterministic floor (lint/typecheck/tests on changed
 # lines). Enabled by default; --no-deterministic disables it. The flag is
@@ -275,9 +275,9 @@ Usage: review.sh [PR_NUMBER|PR_URL] [options]
 Options:
   --threshold FLOAT      Confidence threshold (default 0.8)
   --model MODEL          Codex model (alias for --model-codex)
-  --model-codex MODEL    Codex model (default gpt-5.3-codex)
-  --model-claude MODEL   Claude model (default claude-opus-4-7)
-  --model-verifier MODEL Cross-family verifier model (default claude-opus-4-7)
+  --model-codex MODEL    Codex model (default gpt-5.6-sol)
+  --model-claude MODEL   Claude model (default claude-opus-4-8)
+  --model-verifier MODEL Cross-family verifier model (default claude-opus-4-8)
   --chunker MODE         auto | ast | hunk (default auto)
   --review-rules PATH    Path to REVIEW.md override (must exist)
   --max-diff-lines N     Truncate diff at N lines (0 = unlimited)
